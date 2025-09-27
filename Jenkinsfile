@@ -77,19 +77,21 @@ pipeline {
 
 
     stage('Docker Build & Push') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          bat '''
-            docker build -t %IMAGE_NAME%:%IMAGE_TAG% .
-            echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
-            docker tag %IMAGE_NAME%:%IMAGE_TAG% %IMAGE_NAME%:latest
-            docker push %IMAGE_NAME%:%IMAGE_TAG%
-            docker push %IMAGE_NAME%:latest
-          '''
+    steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
+            bat """
+                docker build -t ${DOCKER_USER}/hd-app:${BUILD_NUMBER} .
+                echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
+                docker push ${DOCKER_USER}/hd-app:${BUILD_NUMBER}
+                docker tag ${DOCKER_USER}/hd-app:${BUILD_NUMBER} ${DOCKER_USER}/hd-app:latest
+                docker push ${DOCKER_USER}/hd-app:latest
+            """
         }
-      }
     }
-  }
+}
+    
 
   post {
     always {
