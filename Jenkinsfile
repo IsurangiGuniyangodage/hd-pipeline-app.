@@ -6,7 +6,7 @@ pipeline {
   }
   environment {
     // Set these in Jenkins (Manage Jenkins > Credentials)
-    GIT_URL = 'https://github.com/IsurangiGuniyangodage/hd-pipeline-app.git'
+    GIT_URL = 'https://github.com/IsurangiGuniyangodage/hd-pipeline-app..git'
     DOCKER_IMAGE = 'isurangiguniyangodage/hd-app'
     SONAR_HOST_URL = '' // provided by withSonarQubeEnv
   }
