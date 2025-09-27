@@ -1,52 +1,61 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-    skipDefaultCheckout(true)
-  }
-  environment {
-    // Set these in Jenkins (Manage Jenkins > Credentials)
-    GIT_URL = 'https://github.com/IsurangiGuniyangodage/hd-pipeline-app..git'
-    DOCKER_IMAGE = 'isurangiguniyangodage/hd-app'
-    SONAR_HOST_URL = '' // provided by withSonarQubeEnv
-  }
-  stages {
 
+  environment {
+    // ---- Image & Registry ----
+    IMAGE_NAME   = "isurangiguniyangodage/hd-app"
+    IMAGE_TAG    = "${env.BUILD_NUMBER}"
+    DOCKER_CREDS = 'dockerhub-creds'
+
+    // ---- SonarQube (Code Quality) ----
+    SONAR_SERVER = "sonarqube"                 // Manage Jenkins -> System -> SonarQube servers (name)
+    SONAR_TOKEN  = credentials('sonar-token')  // (kept globally for convenience; we’ll still rebind in the stage)
+
+    // ---- App URLs (compose maps 9090:3000) ----
+    APP_HEALTH_URL_STAGING = "http://localhost:9090/health"
+    APP_HEALTH_URL_PROD    = "http://localhost:9090/health"
+  }
+
+  options {
+    skipDefaultCheckout(true)
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  stages {
+    // 1) Checkout & Build (artefact built later as Docker image)
     stage('Checkout & Build') {
       steps {
-        checkout([$class: 'GitSCM',
-          branches: [[name: '*/main']],
-          userRemoteConfigs: [[
-            url: env.GIT_URL,
-            credentialsId: 'github-creds'
-          ]]
-        ])
-        bat 'node -v'
-        bat 'npm ci'
-        // your project has no compile step; keep placeholder
-        bat 'npm run build || echo no build step'
+        checkout scm
+        script {
+          bat 'node -v'
+          bat 'npm ci'
+          bat 'npm run build || echo no build step'
+        }
       }
     }
 
+    // 2) Test
     stage('Test') {
       steps {
         bat 'npm test'
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: 'junit.xml, **/junit.xml, **/junit-report.xml, **/junit/*.xml, **/test-results/*.xml'
-          archiveArtifacts artifacts: 'coverage/**', onlyIfSuccessful: false
+          junit 'reports/junit.xml'
+          archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
         }
       }
     }
 
-    stage('Code Quality') {
+    // 3) Code Quality (Sonar) — analysis only (no “quality gate” stage)
+    stage('Code Quality (Sonar)') {
       environment {
+        // scope SONAR_TOKEN into this stage for safety
         SONAR_TOKEN = credentials('sonar-token')
       }
       steps {
-        withSonarQubeEnv('sonarqube') {
-          // Use lcov coverage if present; otherwise Sonar still runs
+        withSonarQubeEnv("${SONAR_SERVER}") {
           bat '''
             if not exist coverage\\lcov.info echo No lcov found (ok)
             sonar-scanner ^
@@ -61,109 +70,135 @@ pipeline {
       }
     }
 
-    stage('Security (Dependencies - Trivy FS)') {
+    // 4) Security — Dependencies/Filesystem (blocking)
+    stage('Security (Trivy FS)') {
       steps {
-        // Scan the repo filesystem; fail only if HIGH/CRITICAL in app deps
-        bat '''
-          docker run --rm -v "%CD%:/repo" aquasec/trivy:latest fs ^
-            --no-progress --scanners vuln --severity HIGH,CRITICAL --exit-code 1 /repo
-        '''
-      }
-      post {
-        unsuccessful {
-          echo 'Dependency scan found HIGH/CRITICAL issues. See console for details and add a note in the report.'
-        }
+        // Dockerized Trivy, fails on HIGH/CRITICAL in your repo/deps
+        bat """
+          docker run --rm ^
+            -v "%CD%:/repo" ^
+            aquasec/trivy:latest fs --no-progress --scanners vuln ^
+            --severity HIGH,CRITICAL --exit-code 1 /repo
+        """
       }
     }
 
+    // 5) Docker Build & Push
     stage('Docker Build & Push') {
-      environment {
-        DOCKER_PASS = credentials('dockerhub-pass')
-      }
       steps {
-        bat 'docker version'
-        script {
-          def buildTag = env.BUILD_NUMBER
-          bat "docker build -t %DOCKER_IMAGE%:${buildTag} ."
-          withCredentials([usernamePassword(credentialsId: 'dockerhub-pass', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASSWORD')]) {
-            bat 'echo %DOCKER_PASSWORD% | docker login -u %DOCKER_USER% --password-stdin'
-          }
-          bat "docker push %DOCKER_IMAGE%:${buildTag}"
-          bat "docker tag  %DOCKER_IMAGE%:${buildTag} %DOCKER_IMAGE%:latest"
-          bat "docker push %DOCKER_IMAGE%:latest"
+        withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
+          bat """
+            docker version
+            docker build -t %DOCKER_USER%/hd-app:${IMAGE_TAG} .
+            echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
+            docker push %DOCKER_USER%/hd-app:${IMAGE_TAG}
+            docker tag  %DOCKER_USER%/hd-app:${IMAGE_TAG} %DOCKER_USER%/hd-app:latest
+            docker push %DOCKER_USER%/hd-app:latest
+          """
         }
       }
     }
 
-    stage('Security (Image - Trivy, Non-blocking)') {
+    // 6) Security — Image (non-blocking; archives report for your write-up)
+    stage('Security (Trivy Image, Non-blocking)') {
       steps {
-        // Create a JSON report but DO NOT fail the pipeline
-        // This lets you include the explanation required by the rubric.
         script {
-          def buildTag = env.BUILD_NUMBER
           bat """
             docker run --rm aquasec/trivy:latest image ^
               --no-progress --format json --ignore-unfixed ^
-              --severity HIGH,CRITICAL --output trivy-image-${buildTag}.json ^
-              %DOCKER_IMAGE%:${buildTag} || ver>NUL
+              --severity HIGH,CRITICAL --output trivy-image-${IMAGE_TAG}.json ^
+              ${IMAGE_NAME}:${IMAGE_TAG} || ver>NUL
           """
         }
       }
       post {
         always {
-          archiveArtifacts artifacts: 'trivy-image-*.json', onlyIfSuccessful: false
-          script {
-            echo 'Image scan completed. If HIGH/CRITICAL OS CVEs exist in the base image, they are documented in the JSON report for your write-up.'
-          }
+          archiveArtifacts artifacts: 'trivy-image-*.json', allowEmptyArchive: true
         }
       }
     }
 
+    // 7) Deploy — Staging via docker-compose (uses your docker-compose.yml)
     stage('Deploy (Staging)') {
       steps {
         script {
-          def buildTag = env.BUILD_NUMBER
-          // Restart container with the new image
-          bat 'docker rm -f hd-app || ver>NUL'
-          bat "docker run -d --name hd-app -p 3000:3000 %DOCKER_IMAGE%:${buildTag}"
+          writeFile file: '.env.staging', text: """IMAGE_NAME=${env.IMAGE_NAME}
+IMAGE_TAG=${env.IMAGE_TAG}
+NODE_ENV=production
+API_KEY=dev-key
+MONGO_INITDB_ROOT_USERNAME=root
+MONGO_INITDB_ROOT_PASSWORD=rootpass
+ME_USER=admin
+ME_PASS=adminpass
+"""
+          // Prefer docker compose if available, else docker-compose
+          def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
+          bat """
+            ${composeCmd} --env-file .env.staging pull
+            ${composeCmd} --env-file .env.staging up -d
+            timeout /t 8 >NUL
+          """
+          bat """
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode } catch { exit 1 }"
+          """
         }
       }
     }
 
-    stage('Release (Promote)') {
+    // 8) Release — manual promotion gate
+    stage('Release: Approve Promotion') {
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          input message: "Promote image ${IMAGE_NAME}:${IMAGE_TAG} to PRODUCTION?"
+        }
+      }
+    }
+
+    // 9) Deploy — Production
+    stage('Deploy (Production)') {
       steps {
         script {
-          def buildTag = env.BUILD_NUMBER
-          // Promote by tagging as "prod" (example)
-          bat "docker tag  %DOCKER_IMAGE%:${buildTag} %DOCKER_IMAGE%:prod"
-          bat "docker push %DOCKER_IMAGE%:prod"
+          writeFile file: '.env.prod', text: """IMAGE_NAME=${env.IMAGE_NAME}
+IMAGE_TAG=${env.IMAGE_TAG}
+NODE_ENV=production
+API_KEY=dev-key
+MONGO_INITDB_ROOT_USERNAME=root
+MONGO_INITDB_ROOT_PASSWORD=rootpass
+ME_USER=admin
+ME_PASS=adminpass
+"""
+          def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
+          bat """
+            ${composeCmd} --env-file .env.prod pull
+            ${composeCmd} --env-file .env.prod up -d
+            timeout /t 8 >NUL
+          """
+          bat """
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { exit 1 }"
+          """
         }
       }
     }
 
-    stage('Monitoring & Alerting (Smoke/Health)') {
+    // 10) Monitoring — simple smoke against prod health
+    stage('Monitoring (Smoke)') {
       steps {
-        // Simple health check to demonstrate monitoring hook
-        // (Your app exposes GET /health)
-        bat '''
-          powershell -Command ^
-            "$ok=$false; for($i=0;$i -lt 10;$i++){ try { $r=Invoke-WebRequest -UseBasicParsing http://localhost:3000/health -TimeoutSec 5; if($r.StatusCode -eq 200){$ok=$true; break} } catch{} Start-Sleep -s 2 }; if(-not $ok){ exit 1 }"
-        '''
+        bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
+      }
+    }
+
+    // Archive useful config at the end
+    stage('Archive & Artifacts') {
+      steps {
+        archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
       }
     }
   }
 
   post {
-    success {
-      echo 'Pipeline completed successfully.'
-    }
-    failure {
-      echo 'Pipeline failed. Check the last failing stage for details.'
-    }
-    always {
-      archiveArtifacts artifacts: 'coverage/**, **/junit*.xml', onlyIfSuccessful: false
-    }
+    success { echo "✅ Pipeline SUCCESS." }
+    failure { echo "❌ Pipeline FAILED." }
   }
 }
-
-// EOF
