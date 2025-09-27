@@ -116,24 +116,31 @@ pipeline {
       }
     }
 
-    // 5b) Security scan the built image
+        stage('Security Scan (Trivy FS)') {
+      steps {
+        script {
+          // scan the workspace via a dockerized trivy
+          bat """
+            docker run --rm ^
+              -v "%cd%:/repo" ^
+              aquasec/trivy:latest fs --no-progress --severity HIGH,CRITICAL --exit-code 1 /repo
+          """
+        }
+      }
+    }
+
     stage('Security Scan (Trivy Image)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
                                           usernameVariable: 'DOCKER_USER',
                                           passwordVariable: 'DOCKER_PASS')]) {
           bat """
-            trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 %DOCKER_USER%/hd-app:${IMAGE_TAG}
-            if %errorlevel% neq 0 (
-              echo "Trivy IMAGE scan found HIGH/CRITICAL vulnerabilities. Failing stage."
-              exit /b 1
-            ) else (
-              echo "Trivy IMAGE scan passed (no HIGH/CRITICAL)."
-            )
+            docker run --rm aquasec/trivy:latest image --no-progress --severity HIGH,CRITICAL --exit-code 1 %DOCKER_USER%/hd-app:${IMAGE_TAG}
           """
         }
       }
     }
+
 
     // 6) Deploy (Staging via docker-compose)
     stage('Deploy to Staging') {
