@@ -2,25 +2,35 @@ pipeline {
   agent any
 
   environment {
-    IMAGE_NAME   = "isurangiguniyangodage/hd-app"   // change to your Docker Hub repo
-    IMAGE_TAG    = "${env.BUILD_NUMBER}"
-    SONAR_SERVER = "sonarqube"              // Jenkins → System → SonarQube servers
-    SONAR_TOKEN  = credentials('sonar-token')
+    // ---- Image & Registry ----
+    IMAGE_NAME    = "isurangiguniyangodage/hd-app"
+    IMAGE_TAG     = "${env.BUILD_NUMBER}"
+    DOCKER_CREDS  = 'dockerhub-creds'
+
+    // ---- SonarQube ----
+    SONAR_SERVER  = "sonarqube"          // Jenkins → Configure System → SonarQube servers (name)
+    SONAR_TOKEN   = credentials('sonar-token')
+
+    // ---- Monitoring/Notifications (optional) ----
+    SLACK_WEBHOOK = credentials('slack-webhook')  // optional
+    APP_HEALTH_URL_STAGING = "http://localhost:9090/health"  // compose maps 9090:3000
+    APP_HEALTH_URL_PROD    = "http://localhost:9090/health"  // same host for demo
   }
 
   options {
     skipDefaultCheckout(true)
     timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   stages {
 
+    // 0) Checkout
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
+    // 1) Build
     stage('Build') {
       steps {
         script {
@@ -31,6 +41,7 @@ pipeline {
       }
     }
 
+    // 2) Test
     stage('Test') {
       steps {
         script {
@@ -45,57 +56,203 @@ pipeline {
       }
     }
 
-  stage('Code Quality (Sonar)') {
-  environment { SONAR_TOKEN = credentials('sonar-token') }
-  steps {
-    withSonarQubeEnv("${SONAR_SERVER}") {
-      bat '''
-        if not exist coverage\\lcov.info echo No lcov found (ok)
-        sonar-scanner ^
-          -Dsonar.tests=_tests_ ^
-          -Dsonar.test.inclusions=_tests_/**/*.js ^
-          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
-      '''
+    // 3) Code Quality (Sonar)
+    stage('Code Quality (Sonar)') {
+      environment { SONAR_TOKEN = credentials('sonar-token') }
+      steps {
+        withSonarQubeEnv("${SONAR_SERVER}") {
+          bat '''
+            if not exist coverage\\lcov.info echo No lcov found (ok)
+            sonar-scanner ^
+              -Dsonar.projectKey=hd-app ^
+              -Dsonar.sources=. ^
+              -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/** ^
+              -Dsonar.tests=_tests_ ^
+              -Dsonar.test.inclusions=_tests_/**/*.js ^
+              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+          '''
+        }
+      }
     }
-  }
-}
 
     stage('Quality Gate') {
-    steps {
+      steps {
         timeout(time: 10, unit: 'MINUTES') {
-            script {
-                def qg = waitForQualityGate()         // uses server from withSonarQubeEnv
-                echo "Quality Gate status: ${qg.status}"
-                if (qg.status in ['ERROR','FAILED']) {
-                error "Pipeline aborted due to quality gate failure: ${qg.status}"
-                }
-        // OK, WARN, NONE -> continue
+          script {
+            def qg = waitForQualityGate()
+            echo "Quality Gate status: ${qg.status}"
+            if (qg.status in ['ERROR','FAILED']) {
+              error "Pipeline aborted due to quality gate failure: ${qg.status}"
+            }
+          }
+        }
+      }
+    }
+
+    // 4) Security (Trivy FS)
+    stage('Security Scan (Trivy FS)') {
+      steps {
+        script {
+          bat '''
+            trivy fs --no-progress --severity HIGH,CRITICAL --exit-code 1 .
+            if %errorlevel% neq 0 ( 
+              echo "Trivy FS scan found HIGH/CRITICAL vulnerabilities. Failing stage."
+              exit /b 1
+            ) else (
+              echo "Trivy FS scan passed (no HIGH/CRITICAL)."
+            )
+          '''
+        }
+      }
+    }
+
+    // 5) Docker Build & Push (artefact)
+    stage('Docker Build & Push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
+          bat """
+            docker version
+            docker build -t %DOCKER_USER%/hd-app:${IMAGE_TAG} .
+            echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
+            docker push %DOCKER_USER%/hd-app:${IMAGE_TAG}
+            docker tag  %DOCKER_USER%/hd-app:${IMAGE_TAG} %DOCKER_USER%/hd-app:latest
+            docker push %DOCKER_USER%/hd-app:latest
+          """
+        }
+      }
+    }
+
+    // Security scan the image too (stricter)
+    stage('Security Scan (Trivy Image)') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
+          bat """
+            trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 %DOCKER_USER%/hd-app:${IMAGE_TAG}
+            if %errorlevel% neq 0 ( 
+              echo "Trivy IMAGE scan found HIGH/CRITICAL vulnerabilities. Failing stage."
+              exit /b 1
+            ) else (
+              echo "Trivy IMAGE scan passed (no HIGH/CRITICAL)."
+            )
+          """
+        }
+      }
+    }
+
+    // 6) Deploy (Staging via docker-compose)
+    stage('Deploy to Staging') {
+      steps {
+        script {
+          writeFile file: '.env.staging', text: """IMAGE_NAME=${env.IMAGE_NAME}
+IMAGE_TAG=${env.IMAGE_TAG}
+NODE_ENV=production
+API_KEY=dev-key
+"""
+          bat """
+            if exist docker-compose.staging.yml (
+              type .env.staging
+              docker-compose --env-file .env.staging -f docker-compose.staging.yml pull
+              docker-compose --env-file .env.staging -f docker-compose.staging.yml up -d
+            ) else (
+              echo docker-compose.staging.yml not found. Using docker-compose.yml
+              docker-compose --env-file .env.staging pull
+              docker-compose --env-file .env.staging up -d
+            )
+            timeout /t 5 >NUL
+          """
+
+          // Health check on host-mapped port (9090)
+          bat """
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode } catch { exit 1 }"
+            if %errorlevel% neq 0 (
+              echo Health check failed for staging at ${APP_HEALTH_URL_STAGING}
+              exit /b 1
+            ) else (
+              echo Staging health check OK
+            )
+          """
+        }
+      }
+    }
+
+    // 7) Release (Promote to Production)
+    stage('Approval: Promote to Production') {
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          input message: "Promote image ${IMAGE_NAME}:${IMAGE_TAG} to PRODUCTION?"
+        }
+      }
+    }
+
+    stage('Deploy to Production') {
+      steps {
+        script {
+          writeFile file: '.env.prod', text: """IMAGE_NAME=${env.IMAGE_NAME}
+IMAGE_TAG=${env.IMAGE_TAG}
+NODE_ENV=production
+API_KEY=dev-key
+"""
+          bat """
+            if exist docker-compose.prod.yml (
+              type .env.prod
+              docker-compose --env-file .env.prod -f docker-compose.prod.yml pull
+              docker-compose --env-file .env.prod -f docker-compose.prod.yml up -d
+            ) else (
+              echo docker-compose.prod.yml not found. Using docker-compose.yml
+              docker-compose --env-file .env.prod pull
+              docker-compose --env-file .env.prod up -d
+            )
+            timeout /t 5 >NUL
+          """
+
+          // Health check (same host port 9090 for demo)
+          bat """
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { exit 1 }"
+            if %errorlevel% neq 0 (
+              echo Health check failed for production at ${APP_HEALTH_URL_PROD}
+              exit /b 1
+            ) else (
+              echo Production health check OK
+            )
+          """
+        }
+      }
+    }
+
+    // Monitoring (basic smoke + metrics capture if exposed)
+    stage('Monitoring & Alerting') {
+      steps {
+        script {
+          bat """
+            powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }"
+          """
+          bat """
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD.replace('/health','/metrics')}').Content | Out-File -FilePath metrics.txt -Encoding utf8 } catch { '' }"
+          """
+          archiveArtifacts artifacts: 'metrics.txt', allowEmptyArchive: true
+
+          bat """
+            if not "${SLACK_WEBHOOK}"=="" (
+              powershell -Command "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '${SLACK_WEBHOOK}' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
+            ) else (
+              echo Slack webhook not configured - skipping.
+            )
+          """
+        }
       }
     }
   }
-}
-
-
-    stage('Docker Build & Push') {
-    steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
-                                          usernameVariable: 'DOCKER_USER',
-                                          passwordVariable: 'DOCKER_PASS')]) {
-            bat """
-                docker build -t ${DOCKER_USER}/hd-app:${BUILD_NUMBER} .
-                echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
-                docker push ${DOCKER_USER}/hd-app:${BUILD_NUMBER}
-                docker tag ${DOCKER_USER}/hd-app:${BUILD_NUMBER} ${DOCKER_USER}/hd-app:latest
-                docker push ${DOCKER_USER}/hd-app:latest
-            """
-        }
-    }
-}
-    }
 
   post {
     always {
-      archiveArtifacts artifacts: 'Dockerfile,docker-compose.yml,sonar-project.properties', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
+      echo "Build #${BUILD_NUMBER} finished."
     }
+    success { echo "Pipeline SUCCESS." }
+    failure { echo "Pipeline FAILED." }
   }
 }
