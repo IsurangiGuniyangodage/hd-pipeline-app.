@@ -1,8 +1,63 @@
+version: "3.9"
+
 services:
-  web:
-    build: .
-    image: hd-app:${IMAGE_TAG:-dev}
-    ports:
-      - "9090:3000"
+  api:
+    image: isurangiguniyangodage/hd-app:${IMAGE_TAG:-latest}
+    container_name: hd-api
     environment:
-      - NODE_ENV=production
+      # App config
+      - PORT=3000
+      - NODE_ENV=${NODE_ENV:-production}
+      - API_KEY=${API_KEY:-dev-key}
+      # DB config - your app should read MONGO_URL from env
+      - MONGO_URL=mongodb://mongo:27017/hdapp?authSource=admin
+    ports:
+      - "9090:3000"              # host:container
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:6.0
+    container_name: hd-mongo
+    command: ["--bind_ip_all"]
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-root}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-rootpass}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--username", "${MONGO_INITDB_ROOT_USERNAME:-root}", "--password", "${MONGO_INITDB_ROOT_PASSWORD:-rootpass}", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  mongo-express:
+    image: mongo-express:1.0.2-20
+    container_name: hd-mongo-express
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongo
+      - ME_CONFIG_MONGODB_ENABLE_ADMIN=true
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=${MONGO_INITDB_ROOT_USERNAME:-root}
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-rootpass}
+      - ME_CONFIG_BASICAUTH=true
+      - ME_CONFIG_BASICAUTH_USERNAME=${ME_USER:-admin}
+      - ME_CONFIG_BASICAUTH_PASSWORD=${ME_PASS:-adminpass}
+    ports:
+      - "9091:8081"              # DB admin UI at http://localhost:9091
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

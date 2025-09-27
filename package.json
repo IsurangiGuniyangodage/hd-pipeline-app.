@@ -1,27 +1,38 @@
 {
- "name": "hd-pipeline-app",
+  "name": "hd-pipeline-app",
   "version": "1.0.0",
+  "description": "Node.js app with CRUD, auth, and CI/CD pipeline for Jenkins + Sonar + Docker",
   "main": "server.js",
   "license": "MIT",
+  "author": "Isurangi Thilakshana Guniyangodage",
+  "keywords": [
+    "express",
+    "crud",
+    "jenkins",
+    "sonar",
+    "docker",
+    "pipeline"
+  ],
   "scripts": {
     "start": "node server.js",
     "build": "echo \"(Node has no compile step; keeping placeholder)\"",
     "test": "jest --runInBand --ci --reporters=default --reporters=jest-junit --coverage",
-    "test:ci": "nyc --reporter=lcov jest --runInBand --ci --reporters=jest-junit"
+    "test:ci": "nyc --reporter=lcov jest --runInBand --ci --reporters=jest-junit",
+    "lint": "eslint ."
   },
-   "jest-junit": {
+  "jest-junit": {
     "outputDirectory": "reports",
     "outputName": "junit.xml"
   },
-  "keywords": [],
-  "author": "",
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^4.19.2",
+    "morgan": "^1.10.0"
   },
   "devDependencies": {
-    "jest": "^30.1.3",
+    "jest": "^29.7.0",
     "jest-junit": "^16.0.0",
     "nyc": "^17.1.0",
-    "supertest": "^7.1.4"
+    "supertest": "^7.1.4",
+    "eslint": "^9.10.0"
   }
 }
