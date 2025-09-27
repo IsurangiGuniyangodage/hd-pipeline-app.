@@ -2,16 +2,13 @@ pipeline {
   agent any
 
   tools {
-    // Use the Node version you added in Global Tool Configuration
-    nodejs 'NodeJS 20'
+    nodejs 'NodeJS 20'  // Manage Jenkins → Global Tool Configuration
   }
 
   environment {
-    IMAGE_NAME   = "yourdockerhub/hd-app"    // <- change to your Docker Hub repo
+    IMAGE_NAME   = "isurangiguniyangodage/hd-app"   
     IMAGE_TAG    = "${env.BUILD_NUMBER}"
-    SONAR_SERVER = "sonarqube"               // Manage Jenkins → System → SonarQube servers (name)
-    // Optional Snyk token; leave as credentials if you set it
-    // SNYK_TOKEN handled via credentials() in the stage
+    SONAR_SERVER = "sonarqube"              // Manage Jenkins → System → SonarQube servers (name)
   }
 
   options {
@@ -20,7 +17,6 @@ pipeline {
   }
 
   stages {
-
     stage('Checkout') {
       steps {
         checkout scm
@@ -61,22 +57,23 @@ pipeline {
 
     stage('Code Quality (Sonar)') { // Step 6
       environment {
-        SONAR_TOKEN = credentials('sonar-token')
+        SONAR_TOKEN = credentials('sonar-token') // Jenkins credential ID
       }
       steps {
         withSonarQubeEnv("${SONAR_SERVER}") {
           script {
-            // produce lcov coverage for Sonar (already created by npm test)
+            // Use the SonarScanner tool installed in Global Tool Configuration
+            def scannerHome = tool name: 'SonarScanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
             if (isUnix()) {
-              sh '''
+              sh """
                 [ -f coverage/lcov.info ] || echo "No lcov found (ok)"
-                sonar-scanner -Dsonar.login=$SONAR_TOKEN
-              '''
+                "${scannerHome}/bin/sonar-scanner" -Dsonar.login=$SONAR_TOKEN
+              """
             } else {
-              bat '''
+              bat """
                 if not exist coverage\\lcov.info echo No lcov found (ok)
-                sonar-scanner -D"sonar.login=%SONAR_TOKEN%"
-              '''
+                "${scannerHome}\\bin\\sonar-scanner.bat" -D"sonar.login=%SONAR_TOKEN%"
+              """
             }
           }
         }
@@ -91,10 +88,10 @@ pipeline {
       }
     }
 
-    stage('Security Scan (Snyk)') { // Step 7  — optional but good for HD
-      when { expression { return true } } // keep on for HD; comment out if you have no token
+    stage('Security Scan (Snyk)') { // Step 7
+      when { expression { return true } }  // leave on for HD
       environment {
-        SNYK_TOKEN = credentials('snyk-token') // add if you created it
+        SNYK_TOKEN = credentials('snyk-token') // create this credential if using Snyk
       }
       steps {
         script {
@@ -113,17 +110,15 @@ pipeline {
       }
     }
 
-    stage('Docker Build & Push (Artifact)') { // Build an artifact for Deploy/Release
+    stage('Docker Build & Push (Artifact)') { // Build artifact for deploy/release
       steps {
         script {
-          // Build image
           if (isUnix()) {
             sh 'docker build -t $IMAGE_NAME:$IMAGE_TAG .'
           } else {
             bat 'docker build -t %IMAGE_NAME%:%IMAGE_TAG% .'
           }
 
-          // Login + push
           withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
             if (isUnix()) {
               sh '''
