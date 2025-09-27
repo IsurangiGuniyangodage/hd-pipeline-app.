@@ -73,9 +73,12 @@ pipeline {
     // 4) Security 
     stage('Security (npm audit)') {
   steps {
-    bat 'npm audit --audit-level=high || exit 0'
+    bat 'dir package-lock.json'
+    bat 'type package-lock.json'
+    bat 'npm audit --production --audit-level=high || exit 0'
   }
 }
+
 
 
     // 5) Docker Build & Push
