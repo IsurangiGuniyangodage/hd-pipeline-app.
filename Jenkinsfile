@@ -4,7 +4,7 @@ pipeline {
   environment {
     IMAGE_NAME   = "isurangiguniyangodage/hd-app"   // change to your Docker Hub repo
     IMAGE_TAG    = "${env.BUILD_NUMBER}"
-    SONAR_SERVER = "sonarqube"              // Jenkins → System → SonarQube servers (name)
+    SONAR_SERVER = "sonarqube"              // Jenkins → System → SonarQube servers
     SONAR_TOKEN  = credentials('sonar-token')
   }
 
@@ -45,22 +45,29 @@ pipeline {
       }
     }
 
-    stage('Code Quality (Sonar)') {
-      steps {
-        withSonarQubeEnv("${SONAR_SERVER}") {
-          script {
-            bat '''
-              if not exist coverage\\lcov.info echo No lcov found (ok)
-              sonar-scanner ^
-                -Dsonar.projectKey=hd-pipeline-app ^
-                -Dsonar.organization=IsurangiGuniyangodage ^
-                -Dsonar.host.url=%SONAR_HOST_URL% ^
-                -Dsonar.login=%SONAR_TOKEN%
-            '''
-          }
+   stage('Code Quality (Sonar)') {
+  environment {
+    SONAR_TOKEN = credentials('sonar-token')   // <-- Your stored Jenkins credential
+  }
+  steps {
+    withSonarQubeEnv("${SONAR_SERVER}") {
+      script {
+        if (isUnix()) {
+          sh '''
+            [ -f coverage/lcov.info ] || echo "No lcov found (ok)"
+            sonar-scanner -Dsonar.login=$SONAR_TOKEN
+          '''
+        } else {
+          bat '''
+            if not exist coverage\\lcov.info echo No lcov found (ok)
+            sonar-scanner -D"sonar.login=%SONAR_TOKEN%"
+          '''
         }
       }
     }
+  }
+}
+
 
     stage('Quality Gate') {
       steps {
