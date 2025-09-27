@@ -8,13 +8,12 @@ pipeline {
     DOCKER_CREDS  = 'dockerhub-creds'
 
     // ---- SonarQube ----
-    SONAR_SERVER  = "sonarqube"          // Jenkins → Configure System → SonarQube servers (name)
-    SONAR_TOKEN   = credentials('sonar-token')
+    SONAR_SERVER  = "sonarqube"                 // Jenkins → Configure System → SonarQube servers (name)
+    SONAR_TOKEN   = credentials('sonar-token')   // Secret Text credential id
 
-    // ---- Monitoring/Notifications (optional) ----
-    SLACK_WEBHOOK = credentials('slack-webhook')  // optional
-    APP_HEALTH_URL_STAGING = "http://localhost:9090/health"  // compose maps 9090:3000
-    APP_HEALTH_URL_PROD    = "http://localhost:9090/health"  // same host for demo
+    // ---- App URLs (compose maps 9090:3000) ----
+    APP_HEALTH_URL_STAGING = "http://localhost:9090/health"
+    APP_HEALTH_URL_PROD    = "http://localhost:9090/health"
   }
 
   options {
@@ -24,11 +23,8 @@ pipeline {
   }
 
   stages {
-
     // 0) Checkout
-    stage('Checkout') {
-      steps { checkout scm }
-    }
+    stage('Checkout') { steps { checkout scm } }
 
     // 1) Build
     stage('Build') {
@@ -43,11 +39,7 @@ pipeline {
 
     // 2) Test
     stage('Test') {
-      steps {
-        script {
-          bat 'npm test'
-        }
-      }
+      steps { script { bat 'npm test' } }
       post {
         always {
           junit 'reports/junit.xml'
@@ -56,7 +48,7 @@ pipeline {
       }
     }
 
-    // 3) Code Quality (Sonar)
+    // 3) Code Quality (Sonar) -> uses _tests_
     stage('Code Quality (Sonar)') {
       environment { SONAR_TOKEN = credentials('sonar-token') }
       steps {
@@ -95,7 +87,7 @@ pipeline {
         script {
           bat '''
             trivy fs --no-progress --severity HIGH,CRITICAL --exit-code 1 .
-            if %errorlevel% neq 0 ( 
+            if %errorlevel% neq 0 (
               echo "Trivy FS scan found HIGH/CRITICAL vulnerabilities. Failing stage."
               exit /b 1
             ) else (
@@ -124,7 +116,7 @@ pipeline {
       }
     }
 
-    // Security scan the image too (stricter)
+    // 5b) Security scan the built image
     stage('Security Scan (Trivy Image)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
@@ -132,7 +124,7 @@ pipeline {
                                           passwordVariable: 'DOCKER_PASS')]) {
           bat """
             trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 %DOCKER_USER%/hd-app:${IMAGE_TAG}
-            if %errorlevel% neq 0 ( 
+            if %errorlevel% neq 0 (
               echo "Trivy IMAGE scan found HIGH/CRITICAL vulnerabilities. Failing stage."
               exit /b 1
             ) else (
@@ -164,16 +156,9 @@ API_KEY=dev-key
             )
             timeout /t 5 >NUL
           """
-
-          // Health check on host-mapped port (9090)
           bat """
             powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode } catch { exit 1 }"
-            if %errorlevel% neq 0 (
-              echo Health check failed for staging at ${APP_HEALTH_URL_STAGING}
-              exit /b 1
-            ) else (
-              echo Staging health check OK
-            )
+            if %errorlevel% neq 0 ( echo Staging health check FAILED & exit /b 1 ) else ( echo Staging health OK )
           """
         }
       }
@@ -208,50 +193,44 @@ API_KEY=dev-key
             )
             timeout /t 5 >NUL
           """
-
-          // Health check (same host port 9090 for demo)
           bat """
             powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { exit 1 }"
-            if %errorlevel% neq 0 (
-              echo Health check failed for production at ${APP_HEALTH_URL_PROD}
-              exit /b 1
-            ) else (
-              echo Production health check OK
-            )
+            if %errorlevel% neq 0 ( echo Production health check FAILED & exit /b 1 ) else ( echo Production health OK )
           """
         }
       }
     }
 
-    // Monitoring (basic smoke + metrics capture if exposed)
+    // 8) Monitoring & Alerting (basic)
     stage('Monitoring & Alerting') {
       steps {
         script {
-          bat """
-            powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }"
-          """
-          bat """
-            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD.replace('/health','/metrics')}').Content | Out-File -FilePath metrics.txt -Encoding utf8 } catch { '' }"
-          """
-          archiveArtifacts artifacts: 'metrics.txt', allowEmptyArchive: true
-
-          bat """
-            if not "${SLACK_WEBHOOK}"=="" (
-              powershell -Command "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '${SLACK_WEBHOOK}' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
-            ) else (
-              echo Slack webhook not configured - skipping.
-            )
-          """
+          bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
+          // optional Slack notify (won't fail if missing)
+          script {
+            try {
+              withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
+                bat """
+                  powershell -Command "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '$env:SLACK_WEBHOOK' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
+                """
+              }
+            } catch (e) {
+              echo 'Slack webhook not configured - skipping notification.'
+            }
+          }
         }
+      }
+    }
+
+    // Final archive in a stage (ensures workspace context)
+    stage('Archive & Artifacts') {
+      steps {
+        archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
       }
     }
   }
 
   post {
-    always {
-      archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
-      echo "Build #${BUILD_NUMBER} finished."
-    }
     success { echo "Pipeline SUCCESS." }
     failure { echo "Pipeline FAILED." }
   }
