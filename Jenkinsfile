@@ -8,8 +8,8 @@ pipeline {
     DOCKER_CREDS = 'dockerhub-creds'
 
     // ---- SonarQube (Code Quality) ----
-    SONAR_SERVER = "sonarqube"                 // Manage Jenkins -> System -> SonarQube servers (name)
-    SONAR_TOKEN  = credentials('sonar-token')  // (kept globally for convenience; we’ll still rebind in the stage)
+    SONAR_SERVER = "sonarqube"
+    SONAR_TOKEN  = credentials('sonar-token')  // convenience; we still rebind in stage
 
     // ---- App URLs (compose maps 9090:3000) ----
     APP_HEALTH_URL_STAGING = "http://localhost:9090/health"
@@ -23,7 +23,7 @@ pipeline {
   }
 
   stages {
-    // 1) Checkout & Build (artefact built later as Docker image)
+    // 1) Checkout & Build
     stage('Checkout & Build') {
       steps {
         checkout scm
@@ -48,12 +48,9 @@ pipeline {
       }
     }
 
-    // 3) Code Quality (Sonar) — analysis only (no “quality gate” stage)
+    // 3) Code Quality (Sonar)
     stage('Code Quality (Sonar)') {
-      environment {
-        // scope SONAR_TOKEN into this stage for safety
-        SONAR_TOKEN = credentials('sonar-token')
-      }
+      environment { SONAR_TOKEN = credentials('sonar-token') }
       steps {
         withSonarQubeEnv("${SONAR_SERVER}") {
           bat '''
@@ -70,16 +67,14 @@ pipeline {
       }
     }
 
-    // 4) Security 
+    // 4) Security (npm audit)
     stage('Security (npm audit)') {
-  steps {
-    bat 'dir package-lock.json'
-    bat 'type package-lock.json'
-    bat 'npm audit --production --audit-level=high || exit 0'
-  }
-}
-
-
+      steps {
+        // prove lockfile exists & run audit without failing the build
+        bat 'dir package-lock.json'
+        bat 'npm audit --production --audit-level=high || exit 0'
+      }
+    }
 
     // 5) Docker Build & Push
     stage('Docker Build & Push') {
@@ -99,7 +94,7 @@ pipeline {
       }
     }
 
-    // 6) Security — Image (non-blocking; archives report for your write-up)
+    // 6) Security — Image (non-blocking; archives report)
     stage('Security (Trivy Image, Non-blocking)') {
       steps {
         script {
@@ -118,7 +113,7 @@ pipeline {
       }
     }
 
-    // 7) Deploy — Staging via docker-compose (uses your docker-compose.yml)
+    // 7) Deploy — Staging
     stage('Deploy (Staging)') {
       steps {
         script {
@@ -131,12 +126,11 @@ MONGO_INITDB_ROOT_PASSWORD=rootpass
 ME_USER=admin
 ME_PASS=adminpass
 """
-          // Prefer docker compose if available, else docker-compose
-          def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
+          def composeCmd = (bat(returnStatus: true, script: 'docker compose version') == 0) ? 'docker compose' : 'docker-compose'
           bat """
             ${composeCmd} --env-file .env.staging pull
             ${composeCmd} --env-file .env.staging up -d
-            timeout /t 8 >NUL
+            ping -n 8 127.0.0.1 >NUL
           """
           bat """
             powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode } catch { exit 1 }"
@@ -167,11 +161,11 @@ MONGO_INITDB_ROOT_PASSWORD=rootpass
 ME_USER=admin
 ME_PASS=adminpass
 """
-          def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
+          def composeCmd = (bat(returnStatus: true, script: 'docker compose version') == 0) ? 'docker compose' : 'docker-compose'
           bat """
             ${composeCmd} --env-file .env.prod pull
             ${composeCmd} --env-file .env.prod up -d
-            timeout /t 8 >NUL
+            ping -n 8 127.0.0.1 >NUL
           """
           bat """
             powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { exit 1 }"
@@ -180,14 +174,14 @@ ME_PASS=adminpass
       }
     }
 
-    // 10) Monitoring — simple smoke against prod health
+    // 10) Monitoring — simple smoke
     stage('Monitoring (Smoke)') {
       steps {
         bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
       }
     }
 
-    // Archive useful config at the end
+    // Archive useful config
     stage('Archive & Artifacts') {
       steps {
         archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
