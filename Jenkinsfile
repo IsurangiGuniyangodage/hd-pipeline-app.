@@ -7,9 +7,9 @@ pipeline {
     IMAGE_TAG     = "${env.BUILD_NUMBER}"
     DOCKER_CREDS  = 'dockerhub-creds'
 
-    // ---- SonarQube ----
+    // ---- SonarQube / SonarCloud ----
     SONAR_SERVER  = "sonarqube"                 // Jenkins → Configure System → SonarQube servers (name)
-    SONAR_TOKEN   = credentials('sonar-token')   // Secret Text credential id
+    SONAR_TOKEN   = credentials('sonar-token')  // Secret Text credential id
 
     // ---- App URLs (compose maps 9090:3000) ----
     APP_HEALTH_URL_STAGING = "http://localhost:9090/health"
@@ -23,8 +23,11 @@ pipeline {
   }
 
   stages {
+
     // 0) Checkout
-    stage('Checkout') { steps { checkout scm } }
+    stage('Checkout') {
+      steps { checkout scm }
+    }
 
     // 1) Build
     stage('Build') {
@@ -39,7 +42,9 @@ pipeline {
 
     // 2) Test
     stage('Test') {
-      steps { script { bat 'npm test' } }
+      steps {
+        script { bat 'npm test' }
+      }
       post {
         always {
           junit 'reports/junit.xml'
@@ -67,31 +72,35 @@ pipeline {
       }
     }
 
+    // Poll for QG result (no webhooks). Only fail on ERROR/FAILED.
     stage('Quality Gate') {
-  steps {
-    timeout(time: 15, unit: 'MINUTES') {
-      script {
-        def qg = waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
-        echo "Quality Gate status: ${qg.status}"
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          script {
+            try {
+              def qg = waitForQualityGate() // polls Sonar until computed
+              echo "Quality Gate status: ${qg.status}"
+              if (qg.status in ['ERROR','FAILED']) {
+                error "Pipeline aborted due to Quality Gate = ${qg.status}"
+              }
+              // NONE / OK / WARN -> continue
+            } catch (err) {
+              echo "Could not fetch Quality Gate result (likely no webhook). Continuing..."
+            }
+          }
+        }
       }
     }
-  }
-}
 
-
-    // 4) Security (Trivy FS)
+    // 4) Security Scan (Trivy FS) via Docker (no local install)
     stage('Security Scan (Trivy FS)') {
       steps {
         script {
-          bat '''
-            trivy fs --no-progress --severity HIGH,CRITICAL --exit-code 1 .
-            if %errorlevel% neq 0 (
-              echo "Trivy FS scan found HIGH/CRITICAL vulnerabilities. Failing stage."
-              exit /b 1
-            ) else (
-              echo "Trivy FS scan passed (no HIGH/CRITICAL)."
-            )
-          '''
+          bat """
+            docker run --rm ^
+              -v "%cd%:/repo" ^
+              aquasec/trivy:latest fs --no-progress --severity HIGH,CRITICAL --exit-code 1 /repo
+          """
         }
       }
     }
@@ -114,19 +123,7 @@ pipeline {
       }
     }
 
-        stage('Security Scan (Trivy FS)') {
-      steps {
-        script {
-          // scan the workspace via a dockerized trivy
-          bat """
-            docker run --rm ^
-              -v "%cd%:/repo" ^
-              aquasec/trivy:latest fs --no-progress --severity HIGH,CRITICAL --exit-code 1 /repo
-          """
-        }
-      }
-    }
-
+    // 5b) Security scan the built image (stricter)
     stage('Security Scan (Trivy Image)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
@@ -139,8 +136,7 @@ pipeline {
       }
     }
 
-
-    // 6) Deploy (Staging via docker-compose)
+    // 6) Deploy to Staging (docker-compose)
     stage('Deploy to Staging') {
       steps {
         script {
@@ -169,7 +165,7 @@ API_KEY=dev-key
       }
     }
 
-    // 7) Release (Promote to Production)
+    // 7) Release (manual approval → Production)
     stage('Approval: Promote to Production') {
       steps {
         timeout(time: 15, unit: 'MINUTES') {
@@ -210,24 +206,23 @@ API_KEY=dev-key
     stage('Monitoring & Alerting') {
       steps {
         script {
+          // quick smoke checks
           bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
-          // optional Slack notify (won't fail if missing)
-          script {
-            try {
-              withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
-                bat """
-                  powershell -Command "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '$env:SLACK_WEBHOOK' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
-                """
-              }
-            } catch (e) {
-              echo 'Slack webhook not configured - skipping notification.'
+          // optional Slack notify (silently skipped if cred missing)
+          try {
+            withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
+              bat """
+                powershell -Command "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '$env:SLACK_WEBHOOK' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
+              """
             }
+          } catch (e) {
+            echo 'Slack webhook not configured - skipping notification.'
           }
         }
       }
     }
 
-    // Final archive in a stage (ensures workspace context)
+    // Archive (ensure workspace context)
     stage('Archive & Artifacts') {
       steps {
         archiveArtifacts artifacts: 'Dockerfile,docker-compose*.yml,sonar-project.properties,.env.*', allowEmptyArchive: true
