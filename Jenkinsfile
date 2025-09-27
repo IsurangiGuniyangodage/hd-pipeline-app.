@@ -46,24 +46,13 @@ pipeline {
     }
 
    stage('Code Quality (Sonar)') {
-  environment {
-    SONAR_TOKEN = credentials('sonar-token')   // <-- Your stored Jenkins credential
-  }
+  environment { SONAR_TOKEN = credentials('sonar-token') }
   steps {
     withSonarQubeEnv("${SONAR_SERVER}") {
-      script {
-        if (isUnix()) {
-          sh '''
-            [ -f coverage/lcov.info ] || echo "No lcov found (ok)"
-            sonar-scanner -Dsonar.login=$SONAR_TOKEN
-          '''
-        } else {
-          bat '''
-            if not exist coverage\\lcov.info echo No lcov found (ok)
-            sonar-scanner -D"sonar.login=%SONAR_TOKEN%"
-          '''
-        }
-      }
+      bat '''
+        if not exist coverage\\lcov.info echo No lcov found (ok)
+        sonar-scanner
+      '''
     }
   }
 }
