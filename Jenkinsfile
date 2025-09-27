@@ -68,18 +68,16 @@ pipeline {
     }
 
     stage('Quality Gate') {
-      steps {
-        timeout(time: 10, unit: 'MINUTES') {
-          script {
-            def qg = waitForQualityGate()
-            echo "Quality Gate status: ${qg.status}"
-            if (qg.status in ['ERROR','FAILED']) {
-              error "Pipeline aborted due to quality gate failure: ${qg.status}"
-            }
-          }
-        }
+  steps {
+    timeout(time: 15, unit: 'MINUTES') {
+      script {
+        def qg = waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
+        echo "Quality Gate status: ${qg.status}"
       }
     }
+  }
+}
+
 
     // 4) Security (Trivy FS)
     stage('Security Scan (Trivy FS)') {
