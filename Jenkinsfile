@@ -45,17 +45,21 @@ pipeline {
       }
     }
 
-   stage('Code Quality (Sonar)') {
+  stage('Code Quality (Sonar)') {
   environment { SONAR_TOKEN = credentials('sonar-token') }
   steps {
     withSonarQubeEnv("${SONAR_SERVER}") {
       bat '''
         if not exist coverage\\lcov.info echo No lcov found (ok)
-        sonar-scanner
+        sonar-scanner ^
+          -Dsonar.tests=_tests_ ^
+          -Dsonar.test.inclusions=_tests_/**/*.js ^
+          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
       '''
     }
   }
 }
+
 
 
     stage('Quality Gate') {
