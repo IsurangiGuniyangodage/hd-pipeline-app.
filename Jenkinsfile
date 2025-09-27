@@ -7,8 +7,8 @@ pipeline {
     IMAGE_TAG    = "${env.BUILD_NUMBER}"
     DOCKER_CREDS = 'dockerhub-creds'
 
-    // ---- SonarQube ----
-    SONAR_SERVER = "sonarqube"                 
+    // ---- SonarQube / SonarCloud ----
+    SONAR_SERVER = "sonarqube"
     SONAR_TOKEN  = credentials('sonar-token')
 
     // ---- Health check URLs ----
@@ -72,19 +72,23 @@ pipeline {
       }
     }
 
-    // 3b) Quality Gate
+    // 3b) Quality Gate — DO NOT FAIL ON NONE
     stage('Quality Gate') {
       steps {
         timeout(time: 15, unit: 'MINUTES') {
           script {
-            def qg = waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
+            def qg = waitForQualityGate()   // polls Sonar; works without webhooks
             echo "Quality Gate status: ${qg.status}"
+            if (qg.status in ['ERROR','FAILED']) {
+              error "Pipeline aborted due to quality gate failure: ${qg.status}"
+            }
+            // OK, WARN, NONE -> continue (per your earlier working logic)
           }
         }
       }
     }
 
-    // 4) Security Scan (Trivy FS)
+    // 4) Security Scan (Trivy FS) - Dockerized (no local install)
     stage('Security Scan (Trivy FS)') {
       steps {
         script {
@@ -138,7 +142,6 @@ ME_USER=admin
 ME_PASS=adminpass
 """
           def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
-
           bat """
             ${composeCmd} --env-file .env.staging pull
             ${composeCmd} --env-file .env.staging up -d
@@ -174,7 +177,6 @@ ME_USER=admin
 ME_PASS=adminpass
 """
           def composeCmd = (bat(script: 'docker compose version', returnStatus: true) == 0) ? 'docker compose' : 'docker-compose'
-
           bat """
             ${composeCmd} --env-file .env.prod pull
             ${composeCmd} --env-file .env.prod up -d
@@ -187,7 +189,7 @@ ME_PASS=adminpass
       }
     }
 
-    // 10) Monitoring
+    // 10) Monitoring (Smoke)
     stage('Monitoring (Smoke)') {
       steps {
         bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
