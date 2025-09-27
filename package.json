@@ -18,7 +18,7 @@
     "build": "echo \"(Node has no compile step; keeping placeholder)\"",
     "test": "jest --runInBand --ci --reporters=default --reporters=jest-junit --coverage",
     "test:ci": "nyc --reporter=lcov jest --runInBand --ci --reporters=jest-junit",
-    "lint": "eslint ."
+   
   },
   "jest-junit": {
     "outputDirectory": "reports",
