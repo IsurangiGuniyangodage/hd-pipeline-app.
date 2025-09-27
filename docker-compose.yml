@@ -1,0 +1,8 @@
+services:
+  web:
+    build: .
+    image: hd-app:${IMAGE_TAG:-dev}
+    ports:
+      - "9090:3000"   
+    environment:
+      - NODE_ENV=production

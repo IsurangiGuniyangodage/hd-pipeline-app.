@@ -1,0 +1,9 @@
+node_modules
+coverage
+reports
+dist
+.env
+node_modules
+coverage
+reports
+.git

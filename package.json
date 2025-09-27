@@ -1,0 +1,27 @@
+{
+ "name": "hd-pipeline-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo \"(Node has no compile step; keeping placeholder)\"",
+    "test": "jest --runInBand --ci --reporters=default --reporters=jest-junit --coverage",
+    "test:ci": "nyc --reporter=lcov jest --runInBand --ci --reporters=jest-junit"
+  },
+   "jest-junit": {
+    "outputDirectory": "reports",
+    "outputName": "junit.xml"
+  },
+  "keywords": [],
+  "author": "",
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "jest": "^30.1.3",
+    "jest-junit": "^16.0.0",
+    "nyc": "^17.1.0",
+    "supertest": "^7.1.4"
+  }
+}
