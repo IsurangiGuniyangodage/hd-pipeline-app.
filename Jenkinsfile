@@ -7,15 +7,9 @@ pipeline {
     IMAGE_TAG    = "${env.BUILD_NUMBER}"
     DOCKER_CREDS = 'dockerhub-creds'
 
-    // ---- SonarQube / SonarCloud ----
-    // Jenkins > Manage Jenkins > Configure System > SonarQube servers (name)
-    SONAR_SERVER = "sonarqube"
-    SONAR_TOKEN  = credentials('sonar-token')
-
-    // ---- Feature flags (safe defaults) ----
-    ENFORCE_TRIVY   = "false"       // "true" to fail on HIGH/CRITICAL
-    ENFORCE_QGATE   = "false"       // "true" to fail pipeline when gate FAILS
-    SKIP_DOCKER_PUSH= "false"       // "true" for CI dry-runs
+    // ---- SonarQube ----
+    SONAR_SERVER = "sonarqube"                  // Jenkins → Configure System → SonarQube servers (name)
+    SONAR_TOKEN  = credentials('sonar-token')   // Secret Text credential id
 
     // ---- App URLs (compose maps 9090:3000) ----
     APP_HEALTH_URL_STAGING = "http://localhost:9090/health"
@@ -39,9 +33,7 @@ pipeline {
     stage('Build') {
       steps {
         script {
-          // Avoid npm engine mismatch noise breaking CI
           bat 'node -v'
-          bat 'npm config set engine-strict false'
           bat 'npm ci'
           bat 'npm run build || echo no build step'
         }
@@ -61,7 +53,7 @@ pipeline {
       }
     }
 
-    // 3) Code Quality (Sonar)
+    // 3) Code Quality (Sonar) -> uses _tests_
     stage('Code Quality (Sonar)') {
       environment { SONAR_TOKEN = credentials('sonar-token') }
       steps {
@@ -71,7 +63,7 @@ pipeline {
             sonar-scanner ^
               -Dsonar.projectKey=hd-app ^
               -Dsonar.sources=. ^
-              -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/build/** ^
+              -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/** ^
               -Dsonar.tests=_tests_ ^
               -Dsonar.test.inclusions=_tests_/**/*.js ^
               -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
@@ -84,33 +76,29 @@ pipeline {
       steps {
         timeout(time: 15, unit: 'MINUTES') {
           script {
-            // Do not kill the build if the server returns "NONE" or the gate isn't set
-            def qg = waitForQualityGate abortPipeline: (env.ENFORCE_QGATE == 'true'), credentialsId: 'sonar-token'
-            echo "Quality Gate status: ${qg?.status ?: 'UNKNOWN'}"
+            // Will throw & fail stage automatically if gate is red
+            def qg = waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
+            echo "Quality Gate status: ${qg.status}"
           }
         }
       }
     }
 
-    // 4) Security (Trivy FS)
+    // 4) Security Scan (Trivy FS) - DOCKERIZED (no local trivy needed)
     stage('Security Scan (Trivy FS)') {
       steps {
         script {
-          def exitCode = (env.ENFORCE_TRIVY == 'true') ? '1' : '0'
-          // Run via dockerized Trivy for consistent tooling on Windows agents
           bat """
             docker run --rm ^
               -v "%cd%:/repo" ^
-              -w /repo ^
-              aquasec/trivy:latest fs --no-progress --ignore-unfixed --severity HIGH,CRITICAL --exit-code ${exitCode} .
+              aquasec/trivy:latest fs --no-progress --severity HIGH,CRITICAL --exit-code 1 /repo
           """
         }
       }
     }
 
-    // 5) Docker Build & Push (artifact)
+    // 5) Docker Build & Push
     stage('Docker Build & Push') {
-      when { expression { env.SKIP_DOCKER_PUSH != 'true' } }
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
                                           usernameVariable: 'DOCKER_USER',
@@ -127,21 +115,44 @@ pipeline {
       }
     }
 
-    // 6) Security (Trivy Image)
+    // 6) Security Scan (Trivy Image) - DOCKERIZED
     stage('Security Scan (Trivy Image)') {
-      when { expression { env.SKIP_DOCKER_PUSH != 'true' } }
       steps {
-        script {
-          def exitCode = (env.ENFORCE_TRIVY == 'true') ? '1' : '0'
+        withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}",
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
           bat """
-            docker run --rm aquasec/trivy:latest image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --exit-code ${exitCode} ${IMAGE_NAME}:${IMAGE_TAG}
+            docker run --rm aquasec/trivy:latest image --no-progress --severity HIGH,CRITICAL --exit-code 1 %DOCKER_USER%/hd-app:${IMAGE_TAG}
           """
         }
       }
     }
 
-    // 7) Deploy to Staging (docker compose v2/v1 compatible)
+    // Helper to resolve compose command on Windows agents
+    stage('Resolve Compose') {
+      steps {
+        script {
+          // Prefer Docker CLI v2 plugin `docker compose`, fallback to legacy `docker-compose`
+          def composeCmd = 'docker compose'
+          def rc = bat(script: 'docker compose version', returnStatus: true)
+          if (rc != 0) {
+            rc = bat(script: 'docker-compose --version', returnStatus: true)
+            if (rc == 0) {
+              composeCmd = 'docker-compose'
+            } else {
+              // None found; set marker env to skip deploy stages gracefully
+              env.NO_COMPOSE = 'true'
+            }
+          }
+          env.COMPOSE_CMD = composeCmd
+          echo "Compose command resolved to: ${env.NO_COMPOSE == 'true' ? 'NONE' : env.COMPOSE_CMD}"
+        }
+      }
+    }
+
+    // 7) Deploy to Staging (non-fatal if compose missing)
     stage('Deploy to Staging') {
+      when { expression { return env.NO_COMPOSE != 'true' } }
       steps {
         script {
           writeFile file: '.env.staging', text: """IMAGE_NAME=${env.IMAGE_NAME}
@@ -149,46 +160,39 @@ IMAGE_TAG=${env.IMAGE_TAG}
 NODE_ENV=production
 API_KEY=dev-key
 """
-          // Try Docker Compose V2 first ("docker compose"); fallback to legacy "docker-compose"
           bat """
-            for /f "tokens=1" %%i in ('docker compose version 2^>NUL ^| findstr /I "Docker Compose"') do set HAS_V2=1
-            if defined HAS_V2 (
-              echo Using docker compose (V2)
-              if exist docker-compose.staging.yml (
-                type .env.staging
-                docker compose --env-file .env.staging -f docker-compose.staging.yml pull
-                docker compose --env-file .env.staging -f docker-compose.staging.yml up -d
-              ) else (
-                echo docker-compose.staging.yml not found. Using docker-compose.yml
-                docker compose --env-file .env.staging pull
-                docker compose --env-file .env.staging up -d
-              )
+            if exist docker-compose.staging.yml (
+              type .env.staging
+              ${env.COMPOSE_CMD} --env-file .env.staging -f docker-compose.staging.yml pull
+              ${env.COMPOSE_CMD} --env-file .env.staging -f docker-compose.staging.yml up -d
             ) else (
-              echo Using docker-compose (legacy)
-              if exist docker-compose.staging.yml (
-                type .env.staging
-                docker-compose --env-file .env.staging -f docker-compose.staging.yml pull
-                docker-compose --env-file .env.staging -f docker-compose.staging.yml up -d
-              ) else (
-                echo docker-compose.staging.yml not found. Using docker-compose.yml
-                docker-compose --env-file .env.staging pull
-                docker-compose --env-file .env.staging up -d
-              )
+              echo docker-compose.staging.yml not found. Using docker-compose.yml
+              ${env.COMPOSE_CMD} --env-file .env.staging pull
+              ${env.COMPOSE_CMD} --env-file .env.staging up -d
             )
+            timeout /t 5 >NUL
           """
-          // Health check with robust PowerShell call
           bat """
-            powershell -NoProfile -Command ^
-              "$ProgressPreference='SilentlyContinue';" ^
-              "try{ (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode -eq 200 } catch{ \$false }" 
-            if %errorlevel% neq 0 ( echo Staging health check FAILED & exit /b 1 ) else ( echo Staging health OK )
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_STAGING}').StatusCode } catch { exit 1 }"
           """
         }
       }
     }
 
-    // 8) Manual Approval
+    // If compose is missing, mark stage unstable but do not fail the build
+    stage('Deploy to Staging (Skipped)') {
+      when { expression { return env.NO_COMPOSE == 'true' } }
+      steps {
+        script {
+          currentBuild.result = 'UNSTABLE'
+          echo 'docker compose / docker-compose not found on agent. Skipping deploy to Staging (build will continue).'
+        }
+      }
+    }
+
+    // 8) Manual approval
     stage('Approval: Promote to Production') {
+      when { expression { return env.NO_COMPOSE != 'true' } }
       steps {
         timeout(time: 15, unit: 'MINUTES') {
           input message: "Promote image ${IMAGE_NAME}:${IMAGE_TAG} to PRODUCTION?"
@@ -196,8 +200,9 @@ API_KEY=dev-key
       }
     }
 
-    // 9) Deploy to Production
+    // 9) Deploy to Production (non-fatal if compose missing)
     stage('Deploy to Production') {
+      when { expression { return env.NO_COMPOSE != 'true' } }
       steps {
         script {
           writeFile file: '.env.prod', text: """IMAGE_NAME=${env.IMAGE_NAME}
@@ -206,55 +211,35 @@ NODE_ENV=production
 API_KEY=dev-key
 """
           bat """
-            for /f "tokens=1" %%i in ('docker compose version 2^>NUL ^| findstr /I "Docker Compose"') do set HAS_V2=1
-            if defined HAS_V2 (
-              echo Using docker compose (V2)
-              if exist docker-compose.prod.yml (
-                type .env.prod
-                docker compose --env-file .env.prod -f docker-compose.prod.yml pull
-                docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
-              ) else (
-                echo docker-compose.prod.yml not found. Using docker-compose.yml
-                docker compose --env-file .env.prod pull
-                docker compose --env-file .env.prod up -d
-              )
+            if exist docker-compose.prod.yml (
+              type .env.prod
+              ${env.COMPOSE_CMD} --env-file .env.prod -f docker-compose.prod.yml pull
+              ${env.COMPOSE_CMD} --env-file .env.prod -f docker-compose.prod.yml up -d
             ) else (
-              echo Using docker-compose (legacy)
-              if exist docker-compose.prod.yml (
-                type .env.prod
-                docker-compose --env-file .env.prod -f docker-compose.prod.yml pull
-                docker-compose --env-file .env.prod -f docker-compose.prod.yml up -d
-              ) else (
-                echo docker-compose.prod.yml not found. Using docker-compose.yml
-                docker-compose --env-file .env.prod pull
-                docker-compose --env-file .env.prod up -d
-              )
+              echo docker-compose.prod.yml not found. Using docker-compose.yml
+              ${env.COMPOSE_CMD} --env-file .env.prod pull
+              ${env.COMPOSE_CMD} --env-file .env.prod up -d
             )
+            timeout /t 5 >NUL
           """
           bat """
-            powershell -NoProfile -Command ^
-              "$ProgressPreference='SilentlyContinue';" ^
-              "try{ (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode -eq 200 } catch{ \$false }"
-            if %errorlevel% neq 0 ( echo Production health check FAILED & exit /b 1 ) else ( echo Production health OK )
+            powershell -Command "try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { exit 1 }"
           """
         }
       }
     }
 
-    // 10) Monitoring & Alerting (optional Slack webhook)
+    // 10) Monitoring & optional Slack notify (never fails the build)
     stage('Monitoring & Alerting') {
       steps {
         script {
-          // Quick 3x health probe
-          bat """powershell -NoProfile -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
-
-          // Slack webhook notify if configured
+          if (env.NO_COMPOSE != 'true') {
+            bat """powershell -Command "1..3 | %%{ try { (Invoke-WebRequest -UseBasicParsing '${APP_HEALTH_URL_PROD}').StatusCode } catch { 'ERR' } }" """
+          }
           try {
             withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
               bat """
-                powershell -NoProfile -Command ^
-                  "$b=@{text='✅ Deployed ${IMAGE_NAME}:${IMAGE_TAG}. Health OK.'} | ConvertTo-Json;" ^
-                  "Invoke-WebRequest -UseBasicParsing -Method Post -Uri '$env:SLACK_WEBHOOK' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($b))"
+                powershell -Command "$b=@{text='✅ Pipeline OK. Image ${IMAGE_NAME}:${IMAGE_TAG} built & scanned.'} | ConvertTo-Json | Invoke-WebRequest -UseBasicParsing -Method Post -Uri '$env:SLACK_WEBHOOK' -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $b)))"
               """
             }
           } catch (e) {
@@ -274,6 +259,7 @@ API_KEY=dev-key
 
   post {
     success { echo "Pipeline SUCCESS." }
+    unstable { echo "Pipeline marked UNSTABLE (deploy skipped or health warn) but not failed." }
     failure { echo "Pipeline FAILED." }
   }
 }
